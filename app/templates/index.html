@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}传输台账 · 地震波形原档接收台{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>登记新传输号</h2>
+  <p class="hint">先登记传输号、数据帧数、原档字节数与 SHA-256，再分批上传 CSV 分片。参数登记后不可修改。</p>
+  <form method="post" action="/deliveries" class="grid-form">
+    <label>传输号
+      <input name="transfer_id" required maxlength="64" pattern="[A-Za-z0-9._-]+"
+             placeholder="例如 STA-20261115-001">
+      <small>字母、数字、点、下划线或连字符</small>
+    </label>
+    <label>数据帧数
+      <input name="frame_count" required type="number" min="2" max="16" step="1" placeholder="2～16">
+      <small>每帧 256 字节，末帧补零</small>
+    </label>
+    <label>原档字节数
+      <input name="size_bytes" required type="number" min="1" placeholder="截断后的真实字节数">
+      <small>须满足 (帧数−1)×256 &lt; 字节数 ≤ 帧数×256</small>
+    </label>
+    <label class="wide">SHA-256
+      <input name="sha256" required pattern="[0-9a-fA-F]{64}" minlength="64" maxlength="64"
+             placeholder="64 位十六进制摘要">
+      <small>对截断后的原档计算</small>
+    </label>
+    <button type="submit" class="primary">登记传输号</button>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>传输台账</h2>
+    <div class="counts">
+      <span class="chip">共 {{ counts.total }}</span>
+      <span class="chip waiting">等待 {{ counts.waiting }}</span>
+      <span class="chip mismatch">摘要不符 {{ counts.mismatch }}</span>
+      <span class="chip published">已发布 {{ counts.published }}</span>
+    </div>
+  </div>
+
+  {% if not items %}
+  <p class="empty">暂无传输记录。先在上方登记一个传输号。</p>
+  {% else %}
+  <div class="table-wrap">
+    <table class="ledger-table">
+      <thead>
+        <tr>
+          <th>传输号</th><th>帧进度</th><th>声明</th><th>状态</th><th>更新时间 / 发布</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for item in items %}
+        <tr>
+          <td><a class="tid" href="/deliveries/{{ item.delivery.transfer_id }}">{{ item.delivery.transfer_id }}</a></td>
+          <td>
+            <div class="frame-dots" aria-label="{{ item.received_count }}/{{ item.delivery.frame_count }} 帧">
+              {% for cell in item.ledger %}
+              <span class="dot {{ cell.state }}" title="第 {{ cell.frame_no }} 帧：{{ {
+                'received':'已收','missing':'缺帧','tentative':'校验帧可临时恢复','recovered':'校验帧恢复'
+              }[cell.state] }}"></span>
+              {% endfor %}
+            </div>
+            <small>{{ item.received_count }}/{{ item.delivery.frame_count }} 帧
+              {% if item.recovered %} · 校验帧恢复 {{ item.recovered|join(',') }}{% endif %}
+              {% if item.missing and item.state.status != 'published' %} · 缺 {{ item.missing|join(',') }}{% endif %}
+              {% if item.has_parity %} · 有校验帧{% endif %}
+            </small>
+          </td>
+          <td class="mono">
+            {{ item.delivery.frame_count }} × 256 B<br>
+            {{ item.delivery.size_bytes }} B<br>
+            <span class="ellipsis">{{ item.delivery.sha256 }}</span>
+          </td>
+          <td><span class="badge {{ item.state.status }}">{{ item.status_label }}</span></td>
+          <td class="mono small">
+            {{ item.state.published_at or item.delivery.created_at }}
+            {% if item.downloadable %}
+            <br><a href="/deliveries/{{ item.delivery.transfer_id }}/download">下载原档</a>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

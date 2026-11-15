@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}{{ view.delivery.transfer_id }} · 地震波形原档接收台{% endblock %}
+{% block content %}
+<p class="breadcrumb"><a href="/">← 返回传输台账</a></p>
+
+{% if view.problem %}<div class="alert error">拒收：{{ view.problem }}</div>{% endif %}
+{% if view.notice %}<div class="alert ok">已处理：{{ view.notice }}</div>{% endif %}
+
+<section class="panel">
+  <div class="panel-head">
+    <div>
+      <h2 class="mono">{{ view.delivery.transfer_id }}</h2>
+      <p class="hint">登记于 {{ view.delivery.created_at }}</p>
+    </div>
+    <span class="badge {{ view.state.status }}">{{ view.status_label }}</span>
+  </div>
+
+  <dl class="meta-grid">
+    <div><dt>数据帧数</dt><dd>{{ view.delivery.frame_count }}</dd></div>
+    <div><dt>原档字节数</dt><dd>{{ view.delivery.size_bytes }}</dd></div>
+    <div><dt>已收数据帧</dt><dd>{{ view.received_count }} / {{ view.delivery.frame_count }}</dd></div>
+    <div><dt>校验帧</dt><dd>{{ '已接收' if view.has_parity else '未接收' }}</dd></div>
+    <div class="wide"><dt>声明 SHA-256</dt><dd class="mono">{{ view.delivery.sha256 }}</dd></div>
+    {% if view.state.status == 'published' %}
+    <div><dt>发布大小</dt><dd>{{ view.state.published_size }} 字节</dd></div>
+    <div><dt>发布时间</dt><dd>{{ view.state.published_at }}</dd></div>
+    <div class="wide"><dt>发布摘要</dt><dd class="mono verified">{{ view.state.published_sha256 }}</dd></div>
+    {% elif view.state.actual_sha256 %}
+    <div class="wide"><dt>当前实际摘要（不符）</dt><dd class="mono bad">{{ view.state.actual_sha256 }}</dd></div>
+    {% endif %}
+  </dl>
+
+  <h3>帧状态</h3>
+  <div class="frame-ledger">
+    {% for cell in view.ledger %}
+    <div class="frame-cell {{ cell.state }}">
+      <span class="no">{{ cell.frame_no }}</span>
+      <span class="label">
+        {% if cell.state == 'received' %}已收
+        {% elif cell.state == 'tentative' %}可临时恢复
+        {% elif cell.state == 'recovered' %}已恢复
+        {% else %}缺帧{% endif %}
+      </span>
+    </div>
+    {% endfor %}
+    <div class="frame-cell parity {{ 'received' if view.has_parity else 'missing' }}">
+      <span class="no">P</span>
+      <span class="label">{{ '校验帧' if view.has_parity else '无校验帧' }}</span>
+    </div>
+  </div>
+
+  {% if view.state.status == 'waiting' %}
+    <div class="alert info">
+      尚缺第 {{ view.missing|join('、') }} 帧。
+      {% if view.recoverable %}
+        已收到校验帧，系统会临时重建第 {{ view.tentative }} 帧并核验；未通过时不会发布，
+        请补传该帧（真实帧仍会被接受）。
+      {% else %}
+        请补传这些帧{% if not view.has_parity %}，或上传校验帧以恢复其中一帧{% endif %}。
+      {% endif %}
+    </div>
+  {% elif view.state.status == 'mismatch' %}
+    <div class="alert error">
+      分片组装后摘要不符，未开放下载，分片已保留。
+      {% if view.tentative %}
+        当前第 {{ view.tentative }} 帧由校验帧临时重建，说明这组分片（或校验帧）本身有误：
+        请补传第 {{ view.tentative }} 帧的真实内容，系统会重新核验。
+      {% else %}
+        请补传缺失或损坏的帧后重新核验。
+      {% endif %}
+      同帧号不同内容会被拒收，如需替换损坏分片请核对传输号与帧号。
+    </div>
+  {% else %}
+    <div class="alert ok">
+      摘要核验通过，原档已原子发布并可下载。
+      {% if view.recovered %}第 {{ view.recovered|join('、') }} 帧由校验帧恢复。{% endif %}
+      已发布档案不会因迟到分片而改变。
+    </div>
+    <a class="button primary" href="/deliveries/{{ view.delivery.transfer_id }}/download">下载 {{ view.delivery.transfer_id }}.bin</a>
+  {% endif %}
+</section>
+
+{% if view.state.status != 'published' %}
+<section class="panel">
+  <h2>分批上传数据帧</h2>
+  <p class="hint">
+    CSV 每行：<code>帧号,十六进制载荷</code>，或三列 <code>传输号,帧号,十六进制载荷</code>；
+    每帧必须为 512 个十六进制字符（256 字节）。校验帧行使用 <code>P</code> 作帧号。
+  </p>
+  <form method="post" action="/deliveries/{{ view.delivery.transfer_id }}/frames" enctype="multipart/form-data" class="stack-form">
+    <label>CSV 文件
+      <input type="file" name="csv_file" accept=".csv,text/csv">
+    </label>
+    <label>或粘贴 CSV
+      <textarea name="csv_text" rows="8" placeholder="transfer_id,frame_no,payload_hex&#10;{{ view.delivery.transfer_id }},1,00a1b2...（512 个十六进制字符）"></textarea>
+    </label>
+    <button type="submit" class="primary">提交分片</button>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>校验帧（可选）</h2>
+    <button type="submit" form="verify-form" class="secondary">重新核验现有分片</button>
+  </div>
+  <p class="hint">
+    校验帧为所有数据帧（含末帧补零）逐字节异或的结果，共 256 字节。只能在缺一帧时恢复；
+    该恢复帧仅用于本次组装，不作入库，真实帧补传后仍会被接受。
+  </p>
+  <form method="post" action="/deliveries/{{ view.delivery.transfer_id }}/parity" enctype="multipart/form-data" class="stack-form">
+    <label>校验帧十六进制
+      <textarea name="parity_hex" rows="3" placeholder="512 个十六进制字符"></textarea>
+    </label>
+    <label>或上传文本文件
+      <input type="file" name="parity_file" accept=".txt,.hex,text/plain">
+    </label>
+    <button type="submit">提交校验帧</button>
+  </form>
+  <form id="verify-form" method="post" action="/deliveries/{{ view.delivery.transfer_id }}/verify"></form>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>处理记录</h2>
+  {% if not audit %}
+  <p class="empty">暂无记录。</p>
+  {% else %}
+  <ol class="audit">
+    {% for row in audit %}
+    <li>
+      <span class="at mono">{{ row.at }}</span>
+      <span class="event">{{ {
+        'registered':'登记','frames':'接收分片','parity':'接收校验帧',
+        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复'
+      }.get(row.event, row.event) }}</span>
+      <span class="detail mono small">{{ row.detail }}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,7 @@
+# runtime data (SQLite, fragments, published archives)
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.db

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}地震波形原档接收台{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="site-head">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>地震波形原档接收台</h1>
+      <p class="tagline">卫星链路分批波形归档 · 帧级校验 · 按摘要放行</p>
+    </div>
+  </div>
+  <nav>
+    <a href="/">传输台账</a>
+    <a href="/docs">接口文档</a>
+    <a href="/healthz">运行状态</a>
+  </nav>
+</header>
+<main>
+{% block content %}{% endblock %}
+</main>
+<footer>
+  <span>256 字节/帧 · 末帧补零 · 单帧 XOR 校验可恢复一帧缺失 · SHA-256 核验后发布</span>
+</footer>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "transfer_id": "STA-20261115-004",
+  "frame_count": 3,
+  "size_bytes": 640,
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "true_sha256": "2aa7d7ee903b04ef6023f0f84108b282aa8e04d92a8dc864efa84928e433f44e",
+  "frame_bytes": 256,
+  "dropped_frames": [],
+  "has_parity": false,
+  "note": "fictional synthetic waveform; safe to upload"
+}
