@@ -3,8 +3,8 @@
 {% block content %}
 <p class="breadcrumb"><a href="/">← 返回传输台账</a></p>
 
-{% if view.problem %}<div class="alert error">拒收：{{ view.problem }}</div>{% endif %}
-{% if view.notice %}<div class="alert ok">已处理：{{ view.notice }}</div>{% endif %}
+{% if problem %}<div class="alert error">拒收：{{ problem }}</div>{% endif %}
+{% if notice %}<div class="alert ok">已处理：{{ notice }}</div>{% endif %}
 
 <section class="panel">
   <div class="panel-head">
@@ -72,13 +72,86 @@
     </div>
   {% else %}
     <div class="alert ok">
-      摘要核验通过，原档已原子发布并可下载。
+      摘要核验通过，原档已原子发布。
       {% if view.recovered %}第 {{ view.recovered|join('、') }} 帧由校验帧恢复。{% endif %}
       已发布档案不会因迟到分片而改变。
     </div>
+    {% if view.downloadable %}
     <a class="button primary" href="/deliveries/{{ view.delivery.transfer_id }}/download">下载 {{ view.delivery.transfer_id }}.bin</a>
+    {% elif view.qc.status == 'pending' %}
+    <div class="alert info">质量判读待复核，新下载已暂停；最新一轮判读通过后自动恢复。</div>
+    {% elif view.qc.status == 'quarantined' %}
+    <div class="alert error">档案已隔离，下载已暂停：{{ view.qc.latest.reason if view.qc.latest else '' }}</div>
+    {% endif %}
   {% endif %}
 </section>
+
+{% if view.state.status == 'published' %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>质量判读（{{ qc_params.sample_rate }} Hz · {{ qc_params.sample_format_label }}）</h2>
+    <span class="badge qc {{ view.qc.status }}">{{ view.qc.label }}</span>
+  </div>
+  <p class="hint">
+    以原档真实字节判读：连续 {{ qc_params.silence_run }} 个零值样点判为静默，
+    连续 {{ qc_params.clip_run }} 个 |样点值| ≥ {{ qc_params.clip_abs }} 判为削顶；
+    记录每类首个异常的起始样点序号（从 0 起计，{{ qc_params.sample_rate }} Hz 下序号 ÷ 100 为秒）。
+    发起判读后新下载先暂停；仅同档最新一轮判读通过才恢复下载。
+  </p>
+
+  {% if view.qc.latest %}
+  <dl class="meta-grid">
+    <div><dt>最新轮次</dt><dd>第 {{ view.qc.latest.run_no }} 轮 · {{ view.qc.latest.status_label }}</dd></div>
+    <div><dt>样点数</dt><dd>{{ view.qc.latest.sample_count if view.qc.latest.sample_count is not none else '—' }}</dd></div>
+    <div><dt>静默起始样点</dt><dd>{{ ('#' ~ view.qc.latest.silence_index ~ '（约 ' ~ view.qc.latest.seconds(view.qc.latest.silence_index) ~ '）') if view.qc.latest.silence_index is not none else '未见' }}</dd></div>
+    <div><dt>削顶起始样点</dt><dd>{{ ('#' ~ view.qc.latest.clip_index ~ '（约 ' ~ view.qc.latest.seconds(view.qc.latest.clip_index) ~ '）') if view.qc.latest.clip_index is not none else '未见' }}</dd></div>
+    <div><dt>发起时间</dt><dd>{{ view.qc.latest.started_at }}</dd></div>
+    <div><dt>完成时间</dt><dd>{{ view.qc.latest.finished_at or '—' }}</dd></div>
+    {% if view.qc.latest.reason %}
+    <div class="wide"><dt>结论 / 原因</dt><dd>{{ view.qc.latest.reason }}</dd></div>
+    {% endif %}
+    {% if view.qc.latest.digest %}
+    <div class="wide"><dt>判读字节摘要</dt><dd class="mono">{{ view.qc.latest.digest }}</dd></div>
+    {% endif %}
+  </dl>
+  {% else %}
+  <p class="hint">尚未发起过质量判读，原档下载不受影响。</p>
+  {% endif %}
+
+  <form method="post" action="/deliveries/{{ view.delivery.transfer_id }}/qc" class="stack-form qc-form">
+    <input type="hidden" name="sample_rate" value="{{ qc_params.sample_rate }}">
+    <input type="hidden" name="sample_format" value="{{ qc_params.sample_format }}">
+    <label class="check">
+      <input type="checkbox" name="confirm" required>
+      <span>确认原档为 {{ qc_params.sample_rate }} Hz、{{ qc_params.sample_format_label }}采样，以其真实字节发起新一轮判读</span>
+    </label>
+    <button type="submit" class="primary">{{ '重新发起质量判读' if view.qc.latest else '发起质量判读' }}</button>
+  </form>
+
+  {% if qc_runs %}
+  <h3>判读轮次</h3>
+  <div class="table-wrap">
+    <table class="ledger-table">
+      <thead>
+        <tr><th>轮次</th><th>结论</th><th>静默起始样点</th><th>削顶起始样点</th><th>发起 / 完成</th><th>原因</th></tr>
+      </thead>
+      <tbody>
+      {% for run in qc_runs %}
+        <tr>
+          <td>#{{ run.run_no }}</td>
+          <td><span class="badge qc-run {{ run.status }}">{{ run.status_label }}</span></td>
+          <td class="mono">{{ ('#' ~ run.silence_index) if run.silence_index is not none else '—' }}</td>
+          <td class="mono">{{ ('#' ~ run.clip_index) if run.clip_index is not none else '—' }}</td>
+          <td class="mono small">{{ run.started_at }}<br>{{ run.finished_at or '—' }}</td>
+          <td class="small">{{ run.reason }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
 
 {% if view.state.status != 'published' %}
 <section class="panel">
@@ -131,7 +204,9 @@
       <span class="at mono">{{ row.at }}</span>
       <span class="event">{{ {
         'registered':'登记','frames':'接收分片','parity':'接收校验帧',
-        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复'
+        'digest-mismatch':'摘要不符','published':'核验发布','recovered':'校验帧恢复',
+        'qc-started':'判读发起','qc-passed':'判读通过','qc-quarantined':'判读隔离',
+        'qc-pending':'判读待复核','qc-interrupted':'判读中断'
       }.get(row.event, row.event) }}</span>
       <span class="detail mono small">{{ row.detail }}</span>
     </li>

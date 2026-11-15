@@ -18,6 +18,8 @@ Each transfer demonstrates one intake path:
 * ``STA-20261115-003`` two frames lost, so intake must wait for re-transmission.
 * ``STA-20261115-004`` every frame arrives but the declared digest is wrong,
   so intake must retain fragments and refuse to publish.
+* ``STA-20261115-005`` publishes cleanly but contains a 100-sample silence run
+  and a 20-sample clipping run, so quality interpretation quarantines it.
 """
 
 from __future__ import annotations
@@ -78,10 +80,13 @@ def build(
     drop: tuple[int, ...] = (),
     parity: bool = False,
     batches: dict[str, list[int]] | None = None,
+    archive: bytes | None = None,
+    note: str = "fictional synthetic waveform; safe to upload",
 ) -> None:
     folder = OUT / transfer_id
     folder.mkdir(parents=True, exist_ok=True)
-    archive = synth_waveform(size_bytes, seed)
+    if archive is None:
+        archive = synth_waveform(size_bytes, seed)
     digest = hashlib.sha256(archive).hexdigest()
     frames = split_frames(archive, frame_count)
     declared = declare_sha or digest
@@ -95,7 +100,7 @@ def build(
         "frame_bytes": FRAME_BYTES,
         "dropped_frames": list(drop),
         "has_parity": parity,
-        "note": "fictional synthetic waveform; safe to upload",
+        "note": note,
     }
     (folder / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     (folder / "expected.bin").write_bytes(archive)
@@ -108,6 +113,21 @@ def build(
         write_csv(folder / name, transfer_id, rows)
     if parity:
         write_csv(folder / "parity.csv", transfer_id, [("P", parity_of(frames))])
+
+
+def qc_demo_archive(size_bytes: int, seed: int) -> bytes:
+    """Quiet synthetic trace with one silence run and one clipping run.
+
+    500 samples (1000 bytes): samples 120..219 are zero (silence starts at
+    sample #120), samples 400..419 sit at full scale (clipping starts at #400).
+    """
+    rng = random.Random(seed)
+    values = [int(rng.gauss(0, 300)) for _ in range(size_bytes // 2)]
+    for i in range(120, 220):
+        values[i] = 0
+    for i in range(400, 420):
+        values[i] = 32767
+    return struct.pack("<" + "h" * len(values), *values)
 
 
 def main() -> None:
@@ -153,6 +173,18 @@ def main() -> None:
         size_bytes=640,
         declare_sha="0" * 64,
         batches={"batch-01.csv": [1, 2, 3]},
+    )
+    build(
+        "STA-20261115-005",
+        seed=97,
+        frame_count=4,
+        size_bytes=1000,
+        archive=qc_demo_archive(1000, 97),
+        batches={
+            "batch-01.csv": [1, 2],
+            "batch-02.csv": [3, 4],
+        },
+        note="fictional trace with silence (#120) and clipping (#400) for QC demo",
     )
     print(f"samples written to {OUT}")
 

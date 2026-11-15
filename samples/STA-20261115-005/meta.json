@@ -1,0 +1,11 @@
+{
+  "transfer_id": "STA-20261115-005",
+  "frame_count": 4,
+  "size_bytes": 1000,
+  "sha256": "6a76956721aefaf65edf48e00b5c329337173e08b6a7836032b70c59f895890b",
+  "true_sha256": "6a76956721aefaf65edf48e00b5c329337173e08b6a7836032b70c59f895890b",
+  "frame_bytes": 256,
+  "dropped_frames": [],
+  "has_parity": false,
+  "note": "fictional trace with silence (#120) and clipping (#400) for QC demo"
+}

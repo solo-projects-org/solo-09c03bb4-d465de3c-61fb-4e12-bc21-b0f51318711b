@@ -35,6 +35,8 @@
       <span class="chip waiting">等待 {{ counts.waiting }}</span>
       <span class="chip mismatch">摘要不符 {{ counts.mismatch }}</span>
       <span class="chip published">已发布 {{ counts.published }}</span>
+      {% if counts.qc_pending %}<span class="chip qc-pending">待复核 {{ counts.qc_pending }}</span>{% endif %}
+      {% if counts.qc_quarantined %}<span class="chip qc-quarantined">已隔离 {{ counts.qc_quarantined }}</span>{% endif %}
     </div>
   </div>
 
@@ -71,7 +73,12 @@
             {{ item.delivery.size_bytes }} B<br>
             <span class="ellipsis">{{ item.delivery.sha256 }}</span>
           </td>
-          <td><span class="badge {{ item.state.status }}">{{ item.status_label }}</span></td>
+          <td>
+            <span class="badge {{ item.state.status }}">{{ item.status_label }}</span>
+            {% if item.qc.status != 'none' %}
+            <br><span class="badge qc {{ item.qc.status }}">{{ item.qc.label }}</span>
+            {% endif %}
+          </td>
           <td class="mono small">
             {{ item.state.published_at or item.delivery.created_at }}
             {% if item.downloadable %}

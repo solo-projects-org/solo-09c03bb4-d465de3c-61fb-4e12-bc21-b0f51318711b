@@ -13,6 +13,18 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .csvintake import MAX_CSV_BYTES, parse_frames_csv
+from .qc import (
+    CLIP_ABS,
+    CLIP_RUN,
+    QC_STATUS_LABELS,
+    RUN_STATUS_LABELS,
+    SAMPLE_FORMAT,
+    SAMPLE_FORMAT_LABEL,
+    SAMPLE_RATE,
+    SILENCE_RUN,
+    QcRun,
+    QcStatus,
+)
 from .storage import (
     FRAME_BYTES,
     MAX_FRAMES,
@@ -36,7 +48,33 @@ STATUS_LABELS = {
 }
 
 
-def api_state(state: ArchiveState) -> dict[str, Any]:
+def qc_run_api(run: QcRun) -> dict[str, Any]:
+    return {
+        "run_no": run.run_no,
+        "status": run.status,
+        "status_label": run.status_label,
+        "sample_rate": run.sample_rate,
+        "sample_format": run.sample_format,
+        "sample_count": run.sample_count,
+        "silence_index": run.silence_index,
+        "clip_index": run.clip_index,
+        "digest": run.digest,
+        "reason": run.reason,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+    }
+
+
+def qc_api(qc: QcStatus) -> dict[str, Any]:
+    return {
+        "status": qc.status,
+        "status_label": qc.label,
+        "download_allowed": qc.download_allowed,
+        "latest_run": qc_run_api(qc.latest) if qc.latest else None,
+    }
+
+
+def api_state(state: ArchiveState, qc: QcStatus | None = None) -> dict[str, Any]:
     published = state.status == STATUS_PUBLISHED
     return {
         "transfer_id": state.delivery.transfer_id,
@@ -62,6 +100,7 @@ def api_state(state: ArchiveState) -> dict[str, Any]:
             else None
         ),
         "actual_sha256": state.actual_sha256,
+        "qc": qc_api(qc) if qc is not None else None,
     }
 
 
@@ -87,6 +126,16 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
         merged = {
             "request": request,
             "statuses": STATUS_LABELS,
+            "qc_statuses": QC_STATUS_LABELS,
+            "run_statuses": RUN_STATUS_LABELS,
+            "qc_params": {
+                "sample_rate": SAMPLE_RATE,
+                "sample_format": SAMPLE_FORMAT,
+                "sample_format_label": SAMPLE_FORMAT_LABEL,
+                "silence_run": SILENCE_RUN,
+                "clip_run": CLIP_RUN,
+                "clip_abs": CLIP_ABS,
+            },
             "frame_bytes": FRAME_BYTES,
             "min_frames": 2,
             "max_frames": 16,
@@ -118,6 +167,7 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
             else:
                 frame_state = "missing"
             ledger.append({"frame_no": frame_no, "state": frame_state})
+        qc = storage.qc_status(delivery.transfer_id)
         return {
             "state": state,
             "delivery": delivery,
@@ -129,7 +179,8 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
             "tentative": tentative,
             "recoverable": tentative is not None,
             "has_parity": state.parity is not None,
-            "downloadable": state.status == STATUS_PUBLISHED,
+            "qc": qc,
+            "downloadable": state.status == STATUS_PUBLISHED and qc.download_allowed,
         }
 
     def outcome_note(state: ArchiveState) -> str:
@@ -151,16 +202,19 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request) -> HTMLResponse:
         states = storage.list_deliveries()
+        views = [state_view(s) for s in states]
         return render(
             request,
             "index.html",
             {
-                "items": [state_view(s) for s in states],
+                "items": views,
                 "counts": {
                     "total": len(states),
                     STATUS_WAITING: sum(1 for s in states if s.status == STATUS_WAITING),
                     STATUS_MISMATCH: sum(1 for s in states if s.status == STATUS_MISMATCH),
                     STATUS_PUBLISHED: sum(1 for s in states if s.status == STATUS_PUBLISHED),
+                    "qc_pending": sum(1 for v in views if v["qc"].status == "pending"),
+                    "qc_quarantined": sum(1 for v in views if v["qc"].status == "quarantined"),
                 },
             },
         )
@@ -183,6 +237,7 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
             "detail.html",
             {
                 "view": state_view(state),
+                "qc_runs": storage.qc_history(transfer_id),
                 "audit": storage.audit_log(transfer_id),
                 "notice": request.query_params.get("ok"),
                 "problem": request.query_params.get("err"),
@@ -237,6 +292,24 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
         except StorageError as exc:
             return redirect_detail(transfer_id, "err", exc.message)
         return redirect_detail(transfer_id, "ok", outcome_note(storage.state(transfer_id)))
+
+    @app.post("/deliveries/{transfer_id}/qc")
+    def qc_page(
+        transfer_id: str,
+        confirm: str = Form(""),
+        sample_rate: str = Form(str(SAMPLE_RATE)),
+        sample_format: str = Form(SAMPLE_FORMAT),
+    ) -> Response:
+        try:
+            run = storage.interpret(
+                transfer_id,
+                confirm=confirm == "on",
+                sample_rate=sample_rate,
+                sample_format=sample_format,
+            )
+        except StorageError as exc:
+            return redirect_detail(transfer_id, "err", exc.message)
+        return redirect_detail(transfer_id, "ok", f"第 {run.run_no} 轮质量判读完成：{run.reason}")
 
     @app.get("/deliveries/{transfer_id}/download")
     def download(transfer_id: str) -> Response:
@@ -298,13 +371,44 @@ def create_app(data_root: str | os.PathLike[str] | None = None) -> FastAPI:
     def api_verify(transfer_id: str) -> JSONResponse:
         return JSONResponse(storage.verify_now(transfer_id))
 
+    @app.post("/api/deliveries/{transfer_id}/qc")
+    def api_qc_start(transfer_id: str, payload: dict | None = Body(None)) -> JSONResponse:
+        payload = payload or {}
+        run = storage.interpret(
+            transfer_id,
+            confirm=bool(payload.get("confirm")),
+            sample_rate=str(payload.get("sample_rate", SAMPLE_RATE)),
+            sample_format=str(payload.get("sample_format", SAMPLE_FORMAT)),
+        )
+        return JSONResponse(qc_run_api(run))
+
+    @app.get("/api/deliveries/{transfer_id}/qc")
+    def api_qc_detail(transfer_id: str) -> JSONResponse:
+        tid = normalize_transfer_id(transfer_id)
+        storage.state(tid)  # 404 for unknown transfer ids
+        return JSONResponse(
+            {
+                "transfer_id": tid,
+                "qc": qc_api(storage.qc_status(tid)),
+                "runs": [qc_run_api(run) for run in storage.qc_history(tid)],
+            }
+        )
+
     @app.get("/api/deliveries")
     def api_list() -> JSONResponse:
-        return JSONResponse({"deliveries": [api_state(s) for s in storage.list_deliveries()]})
+        return JSONResponse(
+            {
+                "deliveries": [
+                    api_state(s, storage.qc_status(s.delivery.transfer_id))
+                    for s in storage.list_deliveries()
+                ]
+            }
+        )
 
     @app.get("/api/deliveries/{transfer_id}")
     def api_detail(transfer_id: str) -> JSONResponse:
-        return JSONResponse(api_state(storage.state(transfer_id)))
+        state = storage.state(transfer_id)
+        return JSONResponse(api_state(state, storage.qc_status(state.delivery.transfer_id)))
 
     @app.get("/api/deliveries/{transfer_id}/download")
     def api_download(transfer_id: str) -> Response:

@@ -33,6 +33,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
+from .qc import (
+    CLIP_ABS,
+    CLIP_RUN,
+    QC_NONE,
+    QC_PENDING,
+    QC_QUARANTINED,
+    RUN_INTERRUPTED,
+    RUN_PASSED,
+    RUN_PENDING_REVIEW,
+    RUN_QUARANTINED,
+    RUN_RUNNING,
+    RUN_TO_QC,
+    SAMPLE_FORMAT,
+    SAMPLE_FORMAT_LABEL,
+    SAMPLE_RATE,
+    SILENCE_RUN,
+    QcRun,
+    QcStatus,
+    decode_s16le,
+    scan_samples,
+)
+
 try:  # POSIX only; Docker image is Linux.
     import fcntl
 except ImportError:  # pragma: no cover
@@ -298,6 +320,24 @@ class Storage:
                     detail      TEXT NOT NULL,
                     at          TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS qc_runs (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transfer_id   TEXT NOT NULL,
+                    run_no        INTEGER NOT NULL,
+                    status        TEXT NOT NULL,
+                    sample_rate   INTEGER NOT NULL,
+                    sample_format TEXT NOT NULL,
+                    sample_count  INTEGER,
+                    silence_index INTEGER,
+                    clip_index    INTEGER,
+                    digest        TEXT,
+                    reason        TEXT NOT NULL DEFAULT '',
+                    started_at    TEXT NOT NULL,
+                    finished_at   TEXT,
+                    UNIQUE(transfer_id, run_no),
+                    FOREIGN KEY (transfer_id) REFERENCES deliveries(transfer_id)
+                );
                 """
             )
         with self._db() as conn:
@@ -328,6 +368,7 @@ class Storage:
                     path.unlink()
                 except OSError:
                     pass
+            self._sweep_interrupted_qc_runs()
         with self._db() as conn:
             rows = conn.execute(
                 "SELECT transfer_id FROM deliveries WHERE status=?", (STATUS_WAITING,)
@@ -730,11 +771,21 @@ class Storage:
         }
 
     def published_path(self, transfer_id: str) -> tuple[Path, str]:
-        """Return (path, digest) for a published archive, verifying before download."""
+        """Return (path, digest) for a published archive, verifying before download.
+
+        Downloads are gated by the quality-interpretation state: once a run has
+        been launched, new downloads pause until the *latest* run passes.
+        """
         tid = normalize_transfer_id(transfer_id)
         row = self._delivery_row(tid)
         if row["status"] != STATUS_PUBLISHED or not row["pub_path"]:
             raise NotFoundError("该传输号尚未发布可下载档案")
+        qc = self.qc_status(tid)
+        if qc.status == QC_PENDING:
+            raise ConflictError("质量判读待复核，新下载已暂停")
+        if qc.status == QC_QUARANTINED:
+            reason = qc.latest.reason if qc.latest else ""
+            raise ConflictError(f"档案已隔离，暂停下载：{reason}")
         path = self.root / row["pub_path"]
         if not path.is_file():
             raise NotFoundError("已发布档案文件缺失，拒绝下载")
@@ -744,6 +795,240 @@ class Storage:
         if digest != row["pub_sha256"]:
             raise ConflictError("已发布档案摘要与登记不符，拒绝下载")
         return path, digest
+
+    # ---------------------------------------------------------- quality control
+    def interpret(
+        self,
+        transfer_id: str,
+        *,
+        confirm: bool,
+        sample_rate: int | str,
+        sample_format: str,
+    ) -> QcRun:
+        """Launch a quality-interpretation run and finish it synchronously.
+
+        The run row is committed as ``running`` *before* the scan starts, so new
+        downloads pause immediately and a crash leaves a recoverable ``running``
+        row (swept to ``interrupted`` at the next startup).
+        """
+        tid = normalize_transfer_id(transfer_id)
+        if not confirm:
+            raise StorageError(
+                f"请先确认原档为 {SAMPLE_RATE} Hz、{SAMPLE_FORMAT_LABEL}采样，再发起质量判读"
+            )
+        try:
+            rate = int(str(sample_rate).strip())
+        except (TypeError, ValueError) as exc:
+            raise StorageError("采样率必须为整数") from exc
+        if rate != SAMPLE_RATE:
+            raise StorageError(f"仅支持 {SAMPLE_RATE} Hz 采样的质量判读")
+        fmt = str(sample_format or "").strip().lower()
+        if fmt != SAMPLE_FORMAT:
+            raise StorageError(f"仅支持{SAMPLE_FORMAT_LABEL}（{SAMPLE_FORMAT}）采样的质量判读")
+        run = self.begin_qc_run(tid, rate, fmt)
+        return self.finish_qc_run(tid, run.run_no)
+
+    def begin_qc_run(self, transfer_id: str, sample_rate: int, sample_format: str) -> QcRun:
+        """Commit a new ``running`` run row; from this moment downloads pause."""
+        tid = normalize_transfer_id(transfer_id)
+        with self._critical():
+            row = self._delivery_row(tid)
+            if row["status"] != STATUS_PUBLISHED or not row["pub_path"]:
+                raise ConflictError("原档尚未核验发布，不能发起质量判读")
+            now = utcnow()
+            with self._db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    run_no = int(
+                        conn.execute(
+                            "SELECT COALESCE(MAX(run_no), 0) + 1 FROM qc_runs WHERE transfer_id=?",
+                            (tid,),
+                        ).fetchone()[0]
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO qc_runs(transfer_id, run_no, status, sample_rate,
+                                            sample_format, reason, started_at)
+                        VALUES (?,?,?,?,?,?,?)
+                        """,
+                        (tid, run_no, RUN_RUNNING, sample_rate, sample_format, "", now),
+                    )
+                    self._audit(
+                        conn,
+                        tid,
+                        "qc-started",
+                        f"第 {run_no} 轮质量判读发起（{sample_rate} Hz / {sample_format}），"
+                        "新下载已暂停",
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        return QcRun(
+            transfer_id=tid,
+            run_no=run_no,
+            status=RUN_RUNNING,
+            sample_rate=sample_rate,
+            sample_format=sample_format,
+            sample_count=None,
+            silence_index=None,
+            clip_index=None,
+            digest=None,
+            reason="",
+            started_at=now,
+            finished_at=None,
+        )
+
+    def finish_qc_run(self, transfer_id: str, run_no: int) -> QcRun:
+        """Scan the published original's real bytes and record the conclusion.
+
+        The update targets exactly this ``(transfer_id, run_no)`` row; the
+        effective QC state is always derived from the newest run, so a stale
+        run finishing late cannot overwrite a newer conclusion.
+        """
+        tid = normalize_transfer_id(transfer_id)
+        row = self._delivery_row(tid)
+        status, sample_count, silence, clip, digest, reason = self._scan_published(row)
+        now = utcnow()
+        with self._critical(), self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = conn.execute(
+                    """
+                    UPDATE qc_runs
+                       SET status=?, sample_count=?, silence_index=?, clip_index=?,
+                           digest=?, reason=?, finished_at=?
+                     WHERE transfer_id=? AND run_no=?
+                    """,
+                    (status, sample_count, silence, clip, digest, reason, now, tid, run_no),
+                )
+                if cursor.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(f"传输号 {tid} 的第 {run_no} 轮判读不存在")
+                event = {
+                    RUN_PASSED: "qc-passed",
+                    RUN_QUARANTINED: "qc-quarantined",
+                    RUN_PENDING_REVIEW: "qc-pending",
+                }[status]
+                self._audit(conn, tid, event, f"第 {run_no} 轮：{reason}")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        return self._qc_run(tid, run_no)
+
+    def qc_status(self, transfer_id: str) -> QcStatus:
+        """Effective QC state, derived from the latest run (none if never run)."""
+        tid = normalize_transfer_id(transfer_id)
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM qc_runs WHERE transfer_id=? ORDER BY run_no DESC LIMIT 1",
+                (tid,),
+            ).fetchone()
+        if row is None:
+            return QcStatus(QC_NONE, None)
+        run = _qc_run_from_row(row)
+        return QcStatus(RUN_TO_QC[run.status], run)
+
+    def qc_history(self, transfer_id: str) -> list[QcRun]:
+        tid = normalize_transfer_id(transfer_id)
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM qc_runs WHERE transfer_id=? ORDER BY run_no DESC",
+                (tid,),
+            ).fetchall()
+        return [_qc_run_from_row(row) for row in rows]
+
+    def _qc_run(self, tid: str, run_no: int) -> QcRun:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM qc_runs WHERE transfer_id=? AND run_no=?",
+                (tid, run_no),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"传输号 {tid} 的第 {run_no} 轮判读不存在")
+        return _qc_run_from_row(row)
+
+    def _scan_published(
+        self, row: sqlite3.Row
+    ) -> tuple[str, int | None, int | None, int | None, str | None, str]:
+        """Read the published original and classify it.
+
+        Returns ``(run_status, sample_count, silence_index, clip_index, digest,
+        reason)``. Digest/size/format abnormalities conclude ``pending_review``
+        (维持待复核) rather than a quality verdict.
+        """
+        tid = row["transfer_id"]
+        pub_path = row["pub_path"]
+        if not pub_path:
+            return (RUN_PENDING_REVIEW, None, None, None, None,
+                    "原档尚未发布可判读的文件，维持待复核")
+        path = self.root / pub_path
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return (RUN_PENDING_REVIEW, None, None, None, None,
+                    "原档文件缺失，无法判读，维持待复核")
+        digest = hashlib.sha256(data).hexdigest()
+        declared_size = int(row["pub_size"])
+        if len(data) != declared_size:
+            return (RUN_PENDING_REVIEW, None, None, None, digest,
+                    f"原档摘要异常：登记 {declared_size} 字节，实际 {len(data)} 字节，维持待复核")
+        if digest != row["pub_sha256"]:
+            return (RUN_PENDING_REVIEW, None, None, None, digest,
+                    f"原档摘要异常：实际 {digest} 与发布登记 {row['pub_sha256']} 不符，维持待复核")
+        if len(data) % 2:
+            return (RUN_PENDING_REVIEW, None, None, None, digest,
+                    f"格式异常：原档 {len(data)} 字节不是完整的 16 位样点序列，"
+                    f"无法按{SAMPLE_FORMAT_LABEL}解码，维持待复核")
+        samples = decode_s16le(data)
+        silence, clip = scan_samples(samples)
+        count = len(samples)
+        if silence is None and clip is None:
+            return (RUN_PASSED, count, None, None, digest,
+                    f"判读通过：{count} 个样点，未见连续 {SILENCE_RUN} 点零值静默"
+                    f"或连续 {CLIP_RUN} 点削顶（|v|≥{CLIP_ABS}）")
+        findings = []
+        if silence is not None:
+            findings.append(f"静默起始样点 #{silence}（约 {silence / SAMPLE_RATE:.2f} s）")
+        if clip is not None:
+            findings.append(f"削顶起始样点 #{clip}（约 {clip / SAMPLE_RATE:.2f} s）")
+        return (RUN_QUARANTINED, count, silence, clip, digest,
+                "发现异常，已隔离：" + "；".join(findings))
+
+    def _sweep_interrupted_qc_runs(self) -> None:
+        """Mark runs left ``running`` by a crash as ``interrupted`` (维持待复核).
+
+        Caller must hold ``_critical``. Idempotent; safe on every startup.
+        """
+        now = utcnow()
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    "SELECT transfer_id, run_no FROM qc_runs WHERE status=?",
+                    (RUN_RUNNING,),
+                ).fetchall()
+                conn.execute(
+                    """
+                    UPDATE qc_runs
+                       SET status=?, finished_at=?,
+                           reason='判读中断（服务重启），维持待复核'
+                     WHERE status=?
+                    """,
+                    (RUN_INTERRUPTED, now, RUN_RUNNING),
+                )
+                for row in rows:
+                    self._audit(
+                        conn,
+                        row["transfer_id"],
+                        "qc-interrupted",
+                        f"第 {row['run_no']} 轮判读中断（服务重启），维持待复核",
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     # ---------------------------------------------------------------- helpers
     def _require_delivery(self, tid: str) -> Delivery:
@@ -826,6 +1111,23 @@ def _delivery_from_row(row: sqlite3.Row) -> Delivery:
         size_bytes=int(row["size_bytes"]),
         sha256=row["sha256"],
         created_at=row["created_at"],
+    )
+
+
+def _qc_run_from_row(row: sqlite3.Row) -> QcRun:
+    return QcRun(
+        transfer_id=row["transfer_id"],
+        run_no=int(row["run_no"]),
+        status=row["status"],
+        sample_rate=int(row["sample_rate"]),
+        sample_format=row["sample_format"],
+        sample_count=None if row["sample_count"] is None else int(row["sample_count"]),
+        silence_index=row["silence_index"],
+        clip_index=row["clip_index"],
+        digest=row["digest"],
+        reason=row["reason"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
     )
 
 
